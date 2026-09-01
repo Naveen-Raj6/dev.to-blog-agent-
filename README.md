@@ -1,7 +1,7 @@
 # AI Blog Publishing Agent — n8n Workflow
 
-An automated pipeline that takes a topic from Telegram, drafts a full technical blog post
-with an LLM, sends it to you for email approval, and publishes the approved version
+A Telegram bot with a menu that lets you: view your latest published dev.to articles,
+or draft a new one with an LLM, review it by email, and publish the approved version
 straight to dev.to.
 
 ---
@@ -9,41 +9,59 @@ straight to dev.to.
 ## Architecture
 
 ```
-Telegram message (topic)
+Telegram message
         │
         ▼
-  AI Agent (Gemini + memory)  ──►  drafts JSON: title, tags, body_markdown
+     Switch (rules: See Posts / Create Post / Menu)
         │
-        ▼
-  Code node (parse/clean JSON, build HTML preview)
-        │
-        ▼
-  Send & Wait (email) ──► you get an email with Approve / Decline buttons
-        │
-        ▼
-  If: approved?
-     │                     │
-     ▼ yes                 ▼ no
-  HTTP POST dev.to     Telegram: "send your feedback"
-     │                     │
-     ▼                     ▼
-  Telegram: "Published!"   loops back to AI Agent with your feedback
+   ┌────┼─────────────────┐
+   ▼    ▼                 ▼
+ Menu  See Posts        Create Post
+   │    │                 │
+   │    ▼                 ▼
+   │  HTTP GET        AI Agent (Gemini + memory)
+   │  dev.to articles      │
+   │    │                  ▼
+   │    ▼             Code node (parse JSON, build preview)
+   │  Code node             │
+   │  (format list)         ▼
+   │    │             Send & Wait (email) ──► Approve/Decline
+   │    ▼                   │
+   │  Telegram: post list   ▼
+   │                  If: data.approved?
+   ▼                  │              │
+ Telegram:            ▼ yes          ▼ no
+ welcome + buttons   HTTP POST     Telegram: "send feedback"
+                     dev.to             │
+                        │               ▼
+                        ▼          loops back to AI Agent
+                  Telegram: "Published!"
 ```
 
 ### Visual node graph (as it appears on the n8n canvas)
 
 ```mermaid
 flowchart LR
-    A["📱 Telegram Trigger<br/>User sends a topic"] --> B["🧠 AI Agent<br/>Gemini + Memory"]
-    B --> C["🧹 Code in JavaScript<br/>Parse JSON, build preview"]
+    A["📱 Telegram Trigger"] --> S["🔀 Switch<br/>Menu / See Posts / Create Post"]
+    S -->|Menu| M["👋 Telegram<br/>Welcome + inline buttons"]
+    S -->|See Posts| P1["🌐 HTTP GET<br/>dev.to/api/articles/me/published"]
+    P1 --> P2["🧹 Code node<br/>Format post list"]
+    P2 --> P3["📋 Telegram<br/>Send post list"]
+    S -->|Create Post| B["🧠 AI Agent<br/>Gemini + Memory"]
+    B --> C["🧹 Code node<br/>Parse JSON, build preview"]
     C --> D["📧 Send & Wait<br/>Email approval"]
     D --> E["🔀 If<br/>data.approved is true"]
-    E -->|true| F["🚀 HTTP Request<br/>POST dev.to/api/articles"]
+    E -->|true| F["🚀 HTTP POST<br/>dev.to/api/articles"]
     E -->|false| G["✏️ Telegram Alert<br/>Ask for feedback"]
     F --> H["✅ Telegram Alert<br/>Published!"]
     G -.loops back to.-> B
 
     style A fill:#4a9eff,stroke:#2b6fc9,color:#fff
+    style S fill:#f5a623,stroke:#c9820f,color:#fff
+    style M fill:#4a9eff,stroke:#2b6fc9,color:#fff
+    style P1 fill:#22b8a0,stroke:#178a78,color:#fff
+    style P2 fill:#22b8a0,stroke:#178a78,color:#fff
+    style P3 fill:#4a9eff,stroke:#2b6fc9,color:#fff
     style B fill:#8e5cf7,stroke:#6a3fc9,color:#fff
     style C fill:#8e5cf7,stroke:#6a3fc9,color:#fff
     style D fill:#22b8a0,stroke:#178a78,color:#fff
@@ -53,11 +71,11 @@ flowchart LR
     style H fill:#4a9eff,stroke:#2b6fc9,color:#fff
 ```
 
-**How to read this:** the flow runs left → right through the main chain. At the If node
-it forks: the top path (green/blue) fires when you approve — it publishes to dev.to and
-sends a success alert. The bottom path (pink) fires when you decline — it asks for your
-feedback over Telegram, then loops back into the AI Agent's memory so the next message
-you send is treated as a revision, not a new topic.
+**How to read this:** everything left of the Switch is the same for every user message.
+The Switch then forks into three lanes — the top lane just shows a menu, the middle lane
+is read-only (fetches and formats your published posts), and the bottom lane is the full
+draft → review → publish pipeline from before, unchanged except for now sitting behind
+the router.
 
 ---
 
@@ -107,9 +125,9 @@ This prints a random URL like `https://random-words-1234.trycloudflare.com`. Cop
 
 ### Re-inject the tunnel URL into n8n
 
-n8n needs to know its own public address so that `resumeUrl` and webhook URLs it
-generates point somewhere reachable — otherwise email approval links and Telegram
-callbacks will fail. Restart the container with `WEBHOOK_URL` set:
+n8n needs to know its own public address so that webhook URLs it generates point
+somewhere reachable — otherwise email approval links and Telegram callbacks will fail.
+Restart the container with `WEBHOOK_URL` set:
 
 ```powershell
 docker stop n8n
@@ -132,6 +150,15 @@ docker run -d `
 **Do this every time the tunnel URL changes** (i.e. every restart, unless you're using a
 named tunnel).
 
+Once running, restart cleanly with the sequence below (safe — your workflows live in the
+`n8n_data` volume, not the container):
+
+```powershell
+docker stop n8n
+docker rm n8n
+docker start n8n   # only if you didn't need to change WEBHOOK_URL
+```
+
 ---
 
 ## 2. Credentials to set up in n8n
@@ -142,7 +169,7 @@ Go to **Credentials → New** for each of these:
 |---|---|---|
 | Google Gemini API | Google PaLM / Gemini API | Paste your Gemini API key |
 | Telegram Bot | Telegram API | Paste your bot token from `@BotFather` |
-| Dev.to Header Auth | Header Auth | Name field must be the literal HTTP header name `api-key` (not a descriptive label like "Dev.to Header Auth") · Value: your dev.to API key (Settings → Extensions on dev.to) |
+| Dev.to Header Auth | Header Auth | Header Name field must be the literal HTTP header name `api-key` (not a descriptive label) · Value: your dev.to API key (Settings → Extensions on dev.to) |
 | Gmail SMTP | SMTP | Host: `smtp.gmail.com` · Port: `465` (SSL) or `587` (TLS) · User: your Gmail address · Password: 16-character Google App Password (not your normal password) |
 
 ---
@@ -153,7 +180,94 @@ Go to **Credentials → New** for each of these:
 - Credential: your Telegram Bot
 - Trigger on: select all
 
-### Node 2 — AI Agent
+### Node 2 — Switch
+- Mode: Rules
+- Routing rules:
+  1. `{{ $json.callback_query?.data || $json.message?.text || "" }}` contains `"See Posts"` → rename output: **See Posts**
+  2. `{{ $json.callback_query?.data || $json.message?.text || "" }}` contains `"Create Post"` → rename output: **Create Post**
+  3. `{{ ($json.message?.text || "").toLowerCase().trim() }}` matches regex `^(\/start|start|hey|yo|hi|hello)$` → rename output: **Menu**
+
+> ⚠️ **Important gap to fix:** these three rules only match the exact phrases "See Posts",
+> "Create Post", or a greeting. When you're mid-revision and reply with free-text feedback
+> (e.g. "add more code examples"), that message won't contain "Create Post" and won't match
+> the greeting regex either — it matches **none** of the rules and falls through with
+> nowhere to go, breaking the revision loop.
+>
+> Fix: add a **fallback/default output** on the Switch node (n8n's Switch has an "Add
+> Fallback Output" option) and route it to the same place as **Create Post**, since any
+> unmatched free text during an active session is almost always either a new topic or
+> revision feedback for the AI Agent to interpret.
+
+### Branch: Menu
+
+#### Node — Telegram (Welcome Menu)
+- Credential: Telegram account
+- Resource: Message | Operation: Send Message
+- Chat ID: `{{ $json.message.chat.id }}`
+- Text: `👋 Welcome! What would you like to do today? Choose an option below:`
+- Reply markup: **Inline keyboard**
+  - Row: `{ text: "See Posts", callback_data: "See Posts" }`, `{ text: "Create Post", callback_data: "Create Post" }`
+
+### Branch: See Posts
+
+#### Node — HTTP Request (GET published articles)
+- Method: `GET`
+- URL: `https://dev.to/api/articles/me/published?per_page=10`
+- Authentication: Generic Credential Type → Header Auth → your Dev.to Header Auth credential
+- Send Headers: on → `api-key: <your dev.to api key>`
+
+#### Node — Code in JavaScript (format post list)
+- Mode: Run once for all items
+- Language: JavaScript
+
+```javascript
+const items = $input.all();
+
+if (!items || items.length === 0 || !items[0].json.id) {
+  return [{
+    json: {
+      formattedText: "📚 <b>No published articles found on your Dev.to account yet!</b>"
+    }
+  }];
+}
+
+let textBuffer = "📚 <b>Your Published Dev.to Articles:</b>\n\n";
+
+items.slice(0, 10).forEach((item, index) => {
+  const article = item.json;
+  const title = article.title || "Untitled Post";
+  const url = article.canonical_url || article.url;
+  const reactions = article.public_reactions_count || 0;
+  const comments = article.comments_count || 0;
+
+  textBuffer += `${index + 1}️⃣ <b><a href="${url}">${title}</a></b>\n`;
+  textBuffer += `   ❤️ ${reactions} reactions  |  💬 ${comments} comments\n\n`;
+});
+
+return [{
+  json: {
+    formattedText: textBuffer
+  }
+}];
+```
+
+> ⚠️ **Bug in the original version of this node:** the URL fallback was hardcoded as
+> `` `https://dev.to/time_pass_d6c977f64396f04/${article.slug}` `` with your username
+> baked in as a literal string. This works only for your account and breaks the moment
+> you reuse this workflow for another dev.to account, or if that username ever changes.
+> The fix above drops the hardcoded fallback and uses `article.url`, which the dev.to API
+> already returns on every article object — no reconstruction needed.
+
+#### Node — Telegram (Send post list)
+- Credential: Telegram account
+- Resource: Message | Operation: Send Message
+- Chat ID: `{{ $json.callback_query?.message?.chat?.id || $json.message?.chat?.id || $('Telegram Trigger').first().json.callback_query?.message?.chat?.id || $('Telegram Trigger').first().json.message?.chat?.id }}`
+- Text: `{{ $json.formattedText }}`
+- Parse mode: **HTML**
+
+### Branch: Create Post (unchanged from before)
+
+#### Node — AI Agent
 
 - **Prompt (User Message)**, set to expression: `{{ $json.message.text }}`
 - **System Message:**
@@ -203,7 +317,7 @@ Gemini model name, since provider model IDs change over time)
 - Key: `{{ $('Telegram Trigger').item.json.message.chat.id }}`
 - Context Window Length: `10`
 
-### Node 3 — Code in JavaScript
+#### Node — Code in JavaScript (parse LLM output)
 - Mode: Run once for each item
 - Language: JavaScript
 
@@ -248,49 +362,31 @@ return {
 };
 ```
 
-### Node 4 — Send message and wait for response (email)
+#### Node — Send message and wait for response (email)
 - Credential: SMTP account
 - Operation: **Send and wait for response**
 - From / To: your addresses
 - Subject: `[DRAFT REVIEW] {{ $json.title }}`
-- **Message HTML** (table-based buttons, no overlap):
+- **Message HTML:**
 
 ```html
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 700px; margin: 0 auto; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 28px; color: #1e293b; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-
-  <!-- Header Badge & Title -->
-  <div style="border-bottom: 2px solid #f1f5f9; padding-bottom: 20px; margin-bottom: 24px;">
-    <span style="background: #eff6ff; color: #2563eb; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase;">Draft Review</span>
-    
-    <h1 style="font-size: 24px; font-weight: 800; color: #0f172a; margin: 16px 0 10px 0; line-height: 1.3;">
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; max-width:700px; margin:0 auto; background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:28px; color:#1e293b;">
+  <div style="border-bottom:2px solid #f1f5f9; padding-bottom:20px; margin-bottom:24px;">
+    <span style="background:#eff6ff; color:#2563eb; padding:6px 12px; border-radius:20px; font-size:12px; font-weight:700; text-transform:uppercase;">Draft Review</span>
+    <h1 style="font-size:24px; font-weight:800; color:#0f172a; margin:16px 0 10px 0; line-height:1.3;">
       {{ $json.title || 'Technical Article Draft' }}
     </h1>
-    
-    <div style="font-size: 14px; color: #64748b;">
-      <strong style="color: #475569;">Tags:</strong> 
+    <div style="font-size:14px; color:#64748b;">
+      <strong style="color:#475569;">Tags:</strong>
       {{ $json.tags ? $json.tags.join(', ') : 'devops, programming' }}
     </div>
   </div>
 
-  <!-- Dev.to Article Preview -->
-  <div style="line-height: 1.7; font-size: 15px; color: #334155; margin-bottom: 32px;">
+  <div style="line-height:1.7; font-size:15px; color:#334155; margin-bottom:32px;">
     {{ $json.formatted_html }}
   </div>
 
-  <!-- Divider -->
-  <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 32px 0;" />
-
-  <!-- Action Callout & Dual Buttons -->
-  <div style="text-align: center; background: #f8fafc; border-radius: 8px; padding: 20px;">
-    <p style="font-size: 14px; font-weight: 600; color: #475569; margin: 0 0 16px 0;">
-      Please review the content above and choose an action:
-    </p>
-
-    <div style="display: inline-flex; gap: 12px; align-items: center; justify-content: center; flex-wrap: wrap;">
-    </div>
-
-  </div>
-
+  <hr style="border:0; border-top:1px solid #e2e8f0; margin:32px 0;" />
 </div>
 ```
 
@@ -301,18 +397,16 @@ return {
   - Disapprove button label: `Decline`, style: `Secondary`
 
 > n8n's built-in Approval response type generates and styles the two buttons itself —
-> you don't need to hand-code button HTML/links for this response type. Hand-coded
-> `resumeUrl` buttons are only needed if you're using the generic **Send and wait for
-> response → Free text / Custom form** option instead.
+> you don't need to hand-code button HTML/links for this response type.
 
-### Node 5 — If
+#### Node — If
 - Condition: `{{ $json.data.approved }}` → **Is Boolean → True**
 - Do **not** use `{{ $json.action }}` — that field doesn't exist on Send & Wait's output
   and will always be undefined, silently routing every execution to the False branch
   even when you click Approve. The Send & Wait (Approval) node returns its result under
   `data.approved`, not `action`.
 
-### Node 6 — HTTP Request (dev.to publish) — True branch
+#### Node — HTTP Request (dev.to publish) — True branch
 - Method: `POST`
 - URL: `https://dev.to/api/articles`
 - Authentication: Generic Credential Type → Header Auth → your Dev.to Header Auth credential
@@ -350,9 +444,9 @@ return {
 }}
 ```
 
-### Node 7 — Telegram Alert (False branch — needs revision)
+#### Node — Telegram Alert (False branch — needs revision)
 - Chat ID: `{{ $('Telegram Trigger').item.json.message.chat.id }}`
-- **Parse mode: HTML** (see "Bugs fixed" below for why)
+- **Parse mode: HTML** (must be set explicitly — see bug note below)
 
 ```html
 ✏️ <b>Revisions requested</b>
@@ -360,7 +454,14 @@ Draft: <b>{{ $('Code in JavaScript').first().json.title || 'Technical Article' }
 Please reply to this chat with your exact feedback (e.g. "Add more code examples for Nginx configuration" or "Simplify the introduction"). The agent will update the draft using your feedback.
 ```
 
-### Node 8 — Telegram Alert (True branch — published)
+> ⚠️ In an earlier draft of this node, parse mode was left unset on this node while
+> the "published" alert node had it set to HTML — an easy thing to miss since they're
+> nearly identical nodes. If parse mode isn't set, Telegram defaults to interpreting
+> `*bold*`/`_italic_` as Markdown, which reintroduces the underscore-eating bug on any
+> field with an underscore. Set HTML parse mode on **every** Telegram send node that
+> uses `<b>` tags, not just the ones that seemed to need it during testing.
+
+#### Node — Telegram Alert (True branch — published)
 - Chat ID: `{{ $('Telegram Trigger').item.json.message.chat.id }}`
 - **Parse mode: HTML**
 
@@ -377,13 +478,14 @@ Please reply to this chat with your exact feedback (e.g. "Add more code examples
 | Symptom | Root cause | Fix |
 |---|---|---|
 | Email fields (title, tags, draft) all empty | System prompt returned freeform Markdown with no separate `title`/`tags` fields to map | Force strict JSON output schema from the LLM, parse it in a Code node before the email node |
-| Approve/Decline buttons overlapped | Buttons built with inline-block/flex, which many email clients don't render reliably | Use n8n's built-in **Approval** response type, which renders buttons safely, or a `<table><td>` layout if hand-coding |
+| Approve/Decline buttons overlapped | Buttons built with inline-block/flex, which many email clients don't render reliably | Use n8n's built-in **Approval** response type, which renders buttons safely |
 | `404: no waiting webhook with matching path/method` | `resumeUrl` links built with `&` instead of `?` for the first query param, OR Wait node's HTTP method set to POST while email links are always GET | Use `?approved=true` (first param needs `?` not `&`); confirm Wait node's method is GET or Any |
 | `invalid token` on resume links | Workflow edited while an execution was paused waiting on that token, OR button already clicked once (tokens are single-use), OR tunnel URL changed between send and click | Don't edit workflow mid-test; trigger a fresh run per test; keep tunnel/n8n stable between send and click, or use a named tunnel |
-| Underscores disappearing from dev.to username in Telegram message | Telegram's Markdown parse mode treats `_..._` as italics and silently consumes single underscores as formatting | Switch the Telegram node's parse mode to **HTML** and use `<b>` instead of `*bold*` — underscores are then treated as literal characters |
-| dev.to URL/title vanish or truncate unexpectedly in other message fields | Same underscore-swallowing issue can hit any field with underscores under Markdown parse mode | Standardize on HTML parse mode across all Telegram/Send-Message nodes |
+| Underscores disappearing from dev.to username in Telegram message | Telegram's Markdown parse mode treats `_..._` as italics and silently consumes single underscores as formatting | Switch every Telegram node to **HTML** parse mode and use `<b>` instead of `*bold*`/`_italic_` |
 | `HTTP Request: Header name must be a valid HTTP token ["Dev.to Header Auth"]` | The credential's Header Name field was set to the descriptive label "Dev.to Header Auth" instead of the actual HTTP header name | Set Header Name to `api-key` (the literal header dev.to expects) and put the token itself in the Value field |
-| Workflow routed to the **False** branch even when clicking Approve | The If node's condition checked `{{ $json.action }}`, which doesn't exist on Send & Wait's output — it's always undefined, which is falsy | Change the condition to `{{ $json.data.approved }}` using **Is Boolean → True** |
+| Workflow routed to the **False** branch even when clicking Approve | The If node's condition checked `{{ $json.action }}`, which doesn't exist on Send & Wait's output — always undefined, which is falsy | Change the condition to `{{ $json.data.approved }}` using **Is Boolean → True** |
+| Hardcoded username in "See Posts" fallback URL | `` `https://dev.to/time_pass_d6c977f64396f04/${slug}` `` bakes in one account's username | Use `article.url` from the dev.to API response instead of reconstructing it |
+| Revision feedback messages go nowhere | Switch node only matches "See Posts", "Create Post", or a greeting regex — free-text feedback matches none of these rules | Add a Switch **fallback/default output** and route it to the same branch as Create Post |
 
 ---
 
@@ -439,8 +541,10 @@ with all data intact.
 
 ## 6. Testing checklist
 
-- [ ] Send a topic via Telegram → confirm AI Agent returns valid JSON (check Code node output)
+- [ ] Send `/start` or "hi" → confirm the welcome menu with inline buttons appears
+- [ ] Tap **See Posts** → confirm your latest published articles list with correct titles/URLs
+- [ ] Tap **Create Post** and send a topic → confirm AI Agent returns valid JSON (check Code node output)
 - [ ] Confirm review email arrives with title, tags, and preview populated
 - [ ] Click **Approve** → confirm dev.to POST succeeds and Telegram "published" message shows the correct URL with underscores intact
-- [ ] Click **Decline** → confirm Telegram asks for feedback, and that replying with feedback correctly triggers a revised draft (check AI Agent memory picks up the chat history)
+- [ ] Click **Decline** → confirm Telegram asks for feedback, and that replying with plain feedback text (no "Create Post" phrase) is still routed correctly once the Switch fallback output is added
 - [ ] Restart the tunnel and confirm `WEBHOOK_URL` was updated before re-testing any email links
